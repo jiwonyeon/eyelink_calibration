@@ -2,21 +2,40 @@
     Run this code after running the calibration. If the light was not completely off during the calibration, 
     please run "neon_pick_markers.py" to pick the markers and then run this code.
     
+    The code is dependent on the pupillabs_utils ### TODO: Need to migrate some of the functions to GazeFlow (?)
+    
     Jiwon Yeon, 2024
 """
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import os, glob, json, cv2, pickle, re
+import os, glob, json, cv2, pickle, re, sys
 # import argparse
 from decord import VideoReader, cpu
 from neon_pick_markers import click_markers, pick_markers
+sys.path.append('../pupillabs_util')
+from px_to_dva import px_to_dva
 
 class MetaData:
     def __init__(self):
         self.data_dir = None
         self.pickle_dir = None
+        
+    def initialization(self):
+        events = pd.read_csv(os.path.join(self.data_dir, 'events.csv'))
+        self.nEvents = int(re.search(r'trial (\d+), end', events['name'].iloc[-2]).group(1))
+        
+        # from the events, sort the target id 
+        target_ids = events['name'][events['name'].str.contains(r'trial \d+, target location')].apply(lambda x: x.split(':')[1].replace(')', '').replace('(', '').strip(''))
+        self.unique_targets = sorted(target_ids.unique())
+        
+        # map the target id 
+        target_ids = target_ids.map({target: idx+1 for idx, target in enumerate(self.unique_targets)})
+        self.target_ids = target_ids.values
+        
+        # get markers
+        self.screen_markers()
 
     def unpickle(self):
         if self.pickle_dir:
@@ -56,140 +75,149 @@ class MetaData:
         
         return gaze_clean
     
-    def find_target_pos(self, frame):        
-        # filter the frame with white color
-        lower_white = np.array([200, 200, 200])
-        upper_white = np.array([255, 255, 255])
-        mask = cv2.inRange(frame, lower_white, upper_white)
-        frame_filtered = cv2.bitwise_and(frame, frame, mask=mask)
-
-        # convert the frame         
-        frame_gray = cv2.cvtColor(frame_filtered, cv2.COLOR_BGR2GRAY)
-        frame_bitwise = cv2.bitwise_not(frame_gray)
+    def dot_px_to_dva(self, x, y):
+        camera_matrix = np.array(json.load(open(os.path.join(self.data_dir, 'scene_camera.json')))['camera_matrix'])
+        distortion_coeffs = np.array(json.load(open(os.path.join(self.data_dir, 'scene_camera.json')))['distortion_coefficients'])
+        dva = px_to_dva(x, y, camera_matrix, distortion_coeffs)
         
-        # crop the frame if needed 
+        return dva
+    
+    def frame_chop(self, frame, markers):
+        min_x = int(np.min(markers[:, 0]))
+        max_x = int(np.max(markers[:, 0]))
+        min_y = int(np.min(markers[:, 1]))
+        max_y = int(np.max(markers[:, 1]))
+    
+        frame_chopped = frame[min_y:max_y, min_x:max_x]
+        return frame_chopped
+        
+    def dot_detector(self, frame):        
         if self.markers is not None:
-            min_x = int(np.min(self.markers[:, 0]))
-            max_x = int(np.max(self.markers[:, 0]))
-            min_y = int(np.min(self.markers[:, 1]))
-            max_y = int(np.max(self.markers[:, 1]))
-            frame_bitwise = frame_bitwise[min_y:max_y, min_x:max_x]
+            markers = self.markers
+        else:
+            markers = [[0,0], [np.shape(frame)[0], 0], [0, np.shape(frame)[1]], [np.shape(frame)[0], np.shape(frame)[1]]]     # if marker is not defined, use the size of the frame 
+            
+        # find center
+        center = [int(np.max(markers[:,0])-np.min(markers[:,0]))/2,
+                int(np.max(markers[:,1])-np.min(markers[:,1]))/2]
         
+        # copy image    
+        frame_c = frame.copy()
+        frame_chopped = self.frame_chop(frame_c, markers)
+
+        # filter image
+        lower = np.array([200, 200, 200])
+        upper = np.array([255, 255, 255])
+        mask = cv2.inRange(frame_chopped, lower, upper)
+        frame_filtered = cv2.bitwise_and(frame_chopped, frame_chopped, mask=mask)
+        frame_gray = cv2.cvtColor(frame_filtered, cv2.COLOR_BGR2GRAY)
+        frame_binary = cv2.threshold(frame_gray, 200, 255, cv2.THRESH_BINARY)[1]
+        
+        # detect blob
         params = cv2.SimpleBlobDetector_Params()
         params.filterByColor = True
-        params.blobColor = 0
-        # params.filterByArea = True
-        # params.filterByCircularity = True
-        # params.minCircularity = .3
-        # params.minArea = 15
-        # params.maxArea = 200
+        params.blobColor = 255
+        params.filterByArea = True
+        params.minArea = 5
+        params.maxArea = 200
+        
         detector = cv2.SimpleBlobDetector_create(params)
-        dots = detector.detect(frame_bitwise)
+        dots = detector.detect(frame_binary)
         
-        target_pos = []
-        for d in dots:
-            x, y = d.pt
-            if self.markers is not None:
-                x, y = x + np.min(self.markers[:, 0]), y + np.min(self.markers[:, 1])
-            target_pos.append([x, y])
+        if len(dots) > 0:
+            for d in range(len(dots)):
+                # remove dots that are close to the center
+                if np.linalg.norm(np.array(dots[d].pt) - np.array(center)) < 10:
+                    dots.pop(d)
             
-        return target_pos
-
-    def px_to_dva(self, x_px, y_px):
-        # load camera intrinsics 
-        camera_matrix = np.array(json.load(open(self.data_dir + '/scene_camera.json'))['camera_matrix'])
-        distortion_coeffs = np.array(json.load(open(self.data_dir + '/scene_camera.json'))['distortion_coefficients'])
+            if len(dots) > 0:   # if still the dots are more than one point, take the one farther from the rim
+                dist = []
+                for d in range(len(dots)):
+                    dist.append(np.linalg.norm(np.array(dots[d].pt) - np.array(center)))
+                dot = dots[np.argmax(dist)]
+                dot = np.array([dot.pt[0] + np.min(markers[:,0]), dot.pt[1] + np.min(markers[:,1])])        
+        else:
+            dot = None
         
-        pixel_coords = np.array([x_px, y_px], dtype=np.float32)
-
-        # First, we need to undistort the points
-        undistorted_point = cv2.undistortPoints(pixel_coords.reshape(1, 1, 2), camera_matrix, distortion_coeffs, P=camera_matrix)
-
-        # Convert to normalized homogeneous coordinates
-        norm_point = np.append(undistorted_point, 1)
-
-        # transform to camera coordinates
-        img_to_cam = np.linalg.inv(camera_matrix)
-        cam_coords = np.dot(img_to_cam, norm_point)
-
-        # Calculate elevation and azimuth based on the camera coordinates
-        elevation = np.rad2deg(np.arctan2(-cam_coords[1], cam_coords[2]))
-        azimuth = np.rad2deg(np.arctan2(cam_coords[0], cam_coords[2]))
-
-        return azimuth, elevation
+        return dot
     
-    def get_disposition(self, gaze, events):
-        # Loop through events
+    def get_dot_position(self):
+        # get video, world_time, events
         video = VideoReader(glob.glob(self.data_dir + '/*.mp4')[0], ctx=cpu(0))
         world_times = pd.read_csv(os.path.join(self.data_dir, 'world_timestamps.csv'))
-        nEvents = int(re.search(r'trial (\d+), end', events['name'].iloc[-2]).group(1))
+        events = pd.read_csv(os.path.join(self.data_dir, 'events.csv'))
         
-        # from the events, sort the target id 
-        target_ids = events['name'][events['name'].str.contains(r'trial \d+, target location')].apply(lambda x: x.split(':')[1].replace(')', '').replace('(', '').strip(''))
-        unique_targets = sorted(target_ids.unique())
+        df = pd.DataFrame(columns=['trial', 'target id', 'frame', 'timestamp [ns]', 'dot x [px]', 'dot y [px]',
+                           'azimuth [deg]', 'elevation [deg]'])
         
-        # assign the target id to the trials
-        target_ids = target_ids.map({target: idx+1 for idx, target in enumerate(unique_targets)})
-        target_ids = target_ids.values
+        for e in range(1,self.nEvents+1):
+            print(f'Processing trial number {e}')
+            start_time = events[events['name'].str.contains(f'trial {e}, target location')]['timestamp [ns]'].values[0]
+            end_time = events[events['name'].str.contains(f'trial {e}, end')]['timestamp [ns]'].values[0]
+
+            frames = world_times[(world_times['timestamp [ns]'] >= start_time) & (world_times['timestamp [ns]'] <= end_time)].index
+            for f in range(len(frames)):
+                frame = video[frames[f]].asnumpy()
+                dots = self.dot_detector(frame)
+                
+                if dots is not None:
+                    dva = self.dot_px_to_dva(dots[0], dots[1])
+                    new_row = pd.DataFrame({
+                    'trial': e,
+                    'target id': self.target_ids[e-1],
+                    'frame': frames[f],
+                    'timestamp [ns]': world_times['timestamp [ns]'][frames[f]],
+                    'dot x [px]': dots[0] if dots is not None else None,
+                    'dot y [px]': dots[1] if dots is not None else None,
+                    'azimuth [deg]': dva[0],
+                    'elevation [deg]': dva[1]}, index=[0])
+                
+                    # add new row to df
+                    df = pd.concat([df, new_row], ignore_index=True)
+
+        # save to csv file 
+        df.to_csv(data_dir + '/dots.csv', index=False)
         
-        df = pd.DataFrame(columns=['trial', 'target id', 'target x [deg]', 'target y [deg]', 
-                                   'target x [px]', 'target y [px]',
-                                   'gaze x [px]', 'gaze y [px]', 
-                                   'gaze x [deg]', 'gaze y [deg]',
-                                   'distance [deg]'])
+    def find_target_positions(self):
+        from sklearn.cluster import DBSCAN
+        from sklearn.preprocessing import StandardScaler
+        dots = pd.read_csv(os.path.join(self.data_dir, 'dots.csv'))
+        data = dots[['azimuth [deg]', 'elevation [deg]']].values
+
+        scaler = StandardScaler()
+        data_scaled = scaler.fit_transform(data)
+
+        dbscan = DBSCAN(eps=0.1, min_samples=30)
+        clusters = dbscan.fit_predict(data_scaled)
+
+        # Get cluster centers (true positive positions)
+        unique_clusters = np.unique(clusters[clusters != -1])  # Exclude noise points (-1)
+        true_positive_positions = [data[clusters == cluster].mean(axis=0) for cluster in unique_clusters]
         
-        for e in range(1, nEvents+1):
-            event_start_time = events['timestamp [ns]'][events['name'].str.contains(f'trial {e}, target location*')].values[0]
-            event_end_time = events['timestamp [ns]'][events['name'].str.contains(f'trial {e}, end')].values[0]
-            
-            # find the video frame
-            frames = world_times[(world_times['timestamp [ns]'] >= event_start_time) & (world_times['timestamp [ns]'] <= event_end_time)].index
-            
-            # find the first frame to get the target position
-            target_pos = []
-            f = int(len(frames)-50)      # grab the frame in the middle 
-            while len(target_pos) != 1: 
-                target_pos = self.find_target_pos(video[frames[f]].asnumpy())
-                f += 1 
-                if f == len(frames):
-                    break
-            # target_pos = self.find_target_pos(video[frames[130]].asnumpy())
-            
-            # if unable to find the target position, manually set the target position 
-            if len(target_pos) == 0:
-                target_pos = click_markers(video[frames[-50]].asnumpy(), 1)
-                target_pos = target_pos[0]
-            else:
-                target_pos = target_pos[0]
-            
-            # change target position to visual angle
-            target_pos_deg = self.px_to_dva(target_pos[0], target_pos[1])
-            
-            # get displacement of the eyes from the target 
-            gaze_trial = gaze[(gaze['timestamp [ns]'] >= event_start_time) & (gaze['timestamp [ns]'] <= event_end_time)]
-            
-            # get the median of the last 80 data points
-            displacement = np.sqrt((gaze_trial['azimuth [deg]'].values[-80:] - target_pos_deg[0])**2 + (gaze_trial['elevation [deg]'].values[-80:] - target_pos_deg[1])**2) 
-            
-            # save the target position as a data frame 
-            new_row = pd.DataFrame({
-                        'trial': [e],
-                        'target id': [target_ids[e-1]],
-                        'target x [px]': [target_pos[0]],
-                        'target y [px]': [target_pos[1]],
-                        'target x [deg]': [target_pos_deg[0]],
-                        'target y [deg]': [target_pos_deg[1]],
-                        'gaze x [px]': [np.median(gaze_trial['gaze x [px]'].values[-80:])],
-                        'gaze y [px]': [np.median(gaze_trial['gaze y [px]'].values[-80:])], 
-                        'gaze x [deg]': [np.median(gaze_trial['azimuth [deg]'].values[-80:])],
-                        'gaze y [deg]': [np.median(gaze_trial['elevation [deg]'].values[-80:])],
-                        'distance [deg]': [np.median(displacement)]})
-            df = pd.concat([df, new_row], ignore_index=True)
+        # from true_positive_positions, remove the closest to the center, and remain 16 points that are closest to the center
+        center = np.mean(true_positive_positions, axis=0)
+        dist = [np.linalg.norm(pos - center) for pos in true_positive_positions]
+        true_positive_positions.pop(np.argmin(dist))
+        dist.pop(np.argmin(dist))
+        true_positive_positions.pop(np.argmax(dist))
+
+        # Plot results
+        plt.figure(figsize=(8, 6))
+        plt.scatter(data[:, 0], data[:, 1], c=clusters, cmap='viridis', s=10)
+        plt.scatter(
+            [pos[0] for pos in true_positive_positions], 
+            [pos[1] for pos in true_positive_positions], 
+            color='red', label='Cluster Centers', marker='x', s=100
+        )
+        plt.title(f"DBSCAN Clustering Results")
+        plt.legend()
+        plt.savefig(os.path.join(self.data_dir, 'target_dots_dbscan_clusters.png'))
+        plt.close()
         
-        df.to_csv(os.path.join(self.data_dir, 'gaze_vs_dot.csv'), index=False)
+        ### TODO: how to save the target positions with the target id?
+        ### TODO: also, how to cluster the px positions of the dots?
         
-    
-    ### TODO: NEED TO FILL OUT THIS SECTION
+        
     
     def see_result(self):
         df = pd.read_csv(os.path.join(self.data_dir, 'gaze_vs_dot.csv'))
@@ -224,20 +252,17 @@ class CustomUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
 def main(meta):
-    # load the data 
-    config, response = meta.unpickle()
-    
-    # get the markers
-    meta.screen_markers()
-    
-    # get the events
-    events = pd.read_csv(os.path.join(meta.data_dir, 'events.csv'))
+    # initialize meta
+    meta.initialization()
         
+    # get the dot position
+    meta.get_dot_position()
+    
+    # from the dot positions, define target positions
+    meta.find_target_positions()
+    
     # get the gaze data 
     gaze = meta.get_clean_gaze()
-    
-    # get the disposition of the eyes for each trial 
-    meta.get_disposition(gaze, events)
     
     # print out the result
     meta.see_result()
