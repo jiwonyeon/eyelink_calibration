@@ -215,9 +215,12 @@ class MetaData:
         plt.close()
         
         ### TODO: how to save the target positions with the target id?
-        ### TODO: also, how to cluster the px positions of the dots?
+        ## save the cluster result that matches to the dots 
+        ## from there, get the mean cluster positions in pixels 
+        ## from dots, save the information of the target id
+        ## rather than save this information, return the information to the main function
         
-        
+    
     
     def see_result(self):
         df = pd.read_csv(os.path.join(self.data_dir, 'gaze_vs_dot.csv'))
@@ -259,7 +262,7 @@ def main(meta):
     meta.get_dot_position()
     
     # from the dot positions, define target positions
-    meta.find_target_positions()
+    target_pos = meta.find_target_positions()
     
     # get the gaze data 
     gaze = meta.get_clean_gaze()
