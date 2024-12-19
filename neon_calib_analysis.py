@@ -27,12 +27,27 @@ class MetaData:
         self.nEvents = int(re.search(r'trial (\d+), end', events['name'].iloc[-2]).group(1))
         
         # from the events, sort the target id 
-        target_ids = events['name'][events['name'].str.contains(r'trial \d+, target location')].apply(lambda x: x.split(':')[1].replace(')', '').replace('(', '').strip(''))
-        self.unique_targets = sorted(target_ids.unique())
+        targets_on_screen = events[events['name'].str.contains(', target location')]['name']
+        trials, x, y = [], [], []
+        for t in targets_on_screen:
+            trials.append(int(re.search(r'trial (\d+)', t).group(1)))
+            x.append(float(re.search(r'(-?\d+\.?\d*), (-?\d+\.?\d*)', t).group(1)))
+            y.append(float(re.search(r'(-?\d+\.?\d*), (-?\d+\.?\d*)', t).group(2)))
         
-        # map the target id 
-        target_ids = target_ids.map({target: idx+1 for idx, target in enumerate(self.unique_targets)})
-        self.target_ids = target_ids.values
+        trials_df = pd.DataFrame({'trial': trials, 'x': x, 'y': y})
+        target_pos = trials_df[['x', 'y']].drop_duplicates().sort_values(by=['x', 'y']).reset_index(drop=True)
+        self.target_pos_screen = target_pos.values
+        
+        # map the target id
+        target_id = np.zeros(len(trials_df))
+        for t_id in range(len(target_pos)):
+            matching = trials_df[(trials_df['x']==target_pos.iloc[t_id]['x']) & (trials_df['y']==target_pos.iloc[t_id]['y'])].index.values
+            target_id[matching] = t_id+1
+        trials_df['target id'] = target_id
+        
+        # save in self 
+        self.target_pos = target_pos[['x', 'y']].values
+        self.target_id = trials_df['target id'].values
         
         # get markers
         self.screen_markers()
@@ -192,21 +207,31 @@ class MetaData:
 
         # Get cluster centers (true positive positions)
         unique_clusters = np.unique(clusters[clusters != -1])  # Exclude noise points (-1)
-        true_positive_positions = [data[clusters == cluster].mean(axis=0) for cluster in unique_clusters]
-        
-        # from true_positive_positions, remove the closest to the center, and remain 16 points that are closest to the center
-        center = np.mean(true_positive_positions, axis=0)
-        dist = [np.linalg.norm(pos - center) for pos in true_positive_positions]
-        true_positive_positions.pop(np.argmin(dist))
-        dist.pop(np.argmin(dist))
-        true_positive_positions.pop(np.argmax(dist))
 
+        # make a data frame using the unique clusters 
+        cluster_df = pd.DataFrame(columns = ['cluster id', 'x [deg]', 'y [deg]', 'x [px]', 'y [px]'])
+        for c in unique_clusters:
+            row = [{'cluster id': c, 
+                    'x [deg]': data[clusters == c][:, 0].mean(),
+                    'y [deg]': data[clusters == c][:, 1].mean(),
+                    'x [px]': dots['dot x [px]'][clusters == c].mean(),
+                    'y [px]': dots['dot y [px]'][clusters == c].mean()}]
+            # append row to cluster_df
+            cluster_df = pd.concat([cluster_df, pd.DataFrame(row)], ignore_index=True)
+
+        # from true_positive_positions, remove the closest to the center, and remain 16 points that are closest to the center
+        center = cluster_df[['x [deg]', 'y [deg]']].mean().values
+        dist = [np.linalg.norm(pos - center) for pos in cluster_df[['x [deg]', 'y [deg]']].values]
+        cluster_df['dist_center'] = dist
+        cluster_df = cluster_df.drop(cluster_df['dist_center'].idxmax())
+        cluster_df = cluster_df.drop(cluster_df['dist_center'].idxmin())
+        
         # Plot results
         plt.figure(figsize=(8, 6))
         plt.scatter(data[:, 0], data[:, 1], c=clusters, cmap='viridis', s=10)
         plt.scatter(
-            [pos[0] for pos in true_positive_positions], 
-            [pos[1] for pos in true_positive_positions], 
+            [pos for pos in cluster_df['x [deg]'].values], 
+            [pos for pos in cluster_df['y [deg]'].values], 
             color='red', label='Cluster Centers', marker='x', s=100
         )
         plt.title(f"DBSCAN Clustering Results")
