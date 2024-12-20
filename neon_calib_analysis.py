@@ -10,7 +10,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import os, glob, json, cv2, pickle, re, sys
+import os, glob, json, cv2, re, sys
 # import argparse
 from decord import VideoReader, cpu
 from neon_pick_markers import click_markers, pick_markers
@@ -20,7 +20,6 @@ from px_to_dva import px_to_dva
 class MetaData:
     def __init__(self):
         self.data_dir = None
-        self.pickle_dir = None
         
     def initialization(self):
         events = pd.read_csv(os.path.join(self.data_dir, 'events.csv'))
@@ -48,17 +47,6 @@ class MetaData:
         
         # get markers
         self.screen_markers()
-
-    def unpickle(self):
-        if self.pickle_dir:
-            with open(self.pickle_dir, 'rb') as f:
-                data = CustomUnpickler(f).load()
-                config = data['config']
-                response = data['data']
-        else:
-            config, response = None, None
-            
-        return config, response
     
     def screen_markers(self):
         # check whether the marker_points.json exists
@@ -256,79 +244,120 @@ class MetaData:
         
         return dots_cluster, cluster_df
     
+    def do_affine(self, target_fix_df):
+        from skimage import transform as tf
+
+        # draw the target and fixation positions 
+        fig, ax = plt.subplots(1,2, figsize=(12, 6))
+
+        # get the average offset
+        eye_offset = np.sqrt((target_fix_df['target detected x [deg]'].values - target_fix_df['gaze pos x [deg]'].values)**2 + \
+            (target_fix_df['target detected y [deg]'].values - target_fix_df['gaze pos y [deg]'].values)**2)
+
+        
+        # gaze after affine transformation
+        transform_matrix = tf.AffineTransform(matrix=None)
+        transform_matrix.estimate(src = target_fix_df[['gaze pos x [deg]', 'gaze pos y [deg]']].to_numpy(),
+                                dst = target_fix_df[['target detected x [deg]', 'target detected y [deg]']].to_numpy())
+        transformed_positions = transform_matrix(target_fix_df[['gaze pos x [deg]', 'gaze pos y [deg]']])
+
+        affine_offset = np.sqrt((transformed_positions[:,0] - target_fix_df['target detected x [deg]'].values)**2 + \
+            (transformed_positions[:,1] - target_fix_df['target detected y [deg]'].values)**2)
+
+        # draw figure
+        cluster_mean = target_fix_df[['target cluster x [deg]', 'target cluster y [deg]']].drop_duplicates().values
+        ax[0].scatter(target_fix_df['gaze pos x [deg]'], target_fix_df['gaze pos y [deg]'], color='black', label='Gaze Fixation', marker='o', s=50)
+        ax[0].scatter(cluster_mean[:,0], cluster_mean[:,1], color='red', label='Cluster Centers', marker='x', s=80)
+        ax[0].set_xlim([-30, 30])
+        ax[0].set_ylim([-30, 30])
+        ax[0].set_title(f'Before transformation, average offset: {np.nanmean(eye_offset):.2f} deg')
+
+        ax[1].scatter(transformed_positions[:,0], transformed_positions[:,1], color='black', label='Gaze Fixation', marker='o', s=50)
+        ax[1].scatter(cluster_mean[:,1], cluster_mean[:,1], color='red', label='Cluster Centers', marker='x', s=80)
+        ax[0].set_xlim([-30, 30])
+        ax[0].set_ylim([-30, 30])
+        ax[1].set_title(f'After transformation, average offset: {np.nanmean(affine_offset):.2f} deg')
+        
+        fig.savefig(os.path.join(self.data_dir, 'gaze_vs_target.png'))
+        
+        # save the transformation matrix
+        np.save(os.path.join(self.data_dir, 'affine_matrix.npy'), transform_matrix.params)
+        
     
-    def see_result(self):
-        df = pd.read_csv(os.path.join(self.data_dir, 'gaze_vs_dot.csv'))
-        
-        # get the median target positions within the same target id 
-        median_target = df.groupby('target id')[['target x [deg]', 'target y [deg]']].median()
-        
-        # in the first figure, plot the raw data with targets
-        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-        for t in range(len(median_target)):
-            target = median_target.iloc[t]
-            ax[0].scatter(target['target x [deg]'], target['target y [deg]'], marker='+', s=100)
-        
-        
-        print(df)
-        
-class CustomUnpickler(pickle.Unpickler):
-    def find_class(self, module, name):
-        # Handle unknown classes dynamically
-        if module == "__main__" and name in ["Config", "Data"]:
-            # Define a placeholder class for unknown classes
-            class Placeholder:
-                def __init__(self, *args, **kwargs):
-                    pass
-                
-                def __repr__(self):
-                    return f"<{name}Placeholder (original class not defined)>"
+    def gaze_vs_target(self, dots_cluster, cluster_df):
+        gaze = self.get_clean_gaze()
+
+        target_fix_df = pd.DataFrame(columns=['trial', 'target id', 'target cluster x [deg]', 'target cluster y [deg]',
+                'target pos screen x [px]', 'target pos screen y [px]', 'target detected x [deg]', 'target detected y [deg]', 
+                'gaze pos x [deg]','gaze pos y [deg]'])
+
+        for t in range(1, self.nEvents+1):
+            this_trial = dots_cluster[dots_cluster['trial'] == t]
+            target_id = this_trial['target id'].unique()[0]
+
+            # find the average target position from the cluster_df
+            target_pos = cluster_df[cluster_df['target id'] == target_id][['x [deg]', 'y [deg]']].values[0]
+            distance = np.sqrt((this_trial['x [deg]'] - target_pos[0])**2 + (this_trial['y [deg]'] - target_pos[1])**2)
+            mask = np.abs(distance) < 1
+            # if there are no points within 1 degree, take the 10 closest points
+            if len(this_trial[mask]) == 0:
+                mask = distance.sort_values()
+                mask = mask < mask.iloc[10]
+                mask = mask.sort_index()
+
+            # get average target position of the trial
+            trial_target_pos = this_trial[mask][['x [deg]', 'y [deg]']].mean(skipna=True).values
+
+            # find the gaze positions 
+            this_gaze = gaze[(gaze['timestamp [ns]'] >= this_trial['timestamp [ns]'].min()) &
+                            (gaze['timestamp [ns]'] <= this_trial['timestamp [ns]'].max())]
+
+            # select the last 500 ms window
+            time = ((this_gaze['timestamp [ns]'] - this_gaze['timestamp [ns]'].values[0])/1e9)
+            index = time[time >= time.max()-0.5].index
             
-            return Placeholder
+            gaze_at_target = this_gaze.loc[index][['azimuth [deg]', 'elevation [deg]']].values
+            
+            # add to a data frame
+            new_row = pd.DataFrame({
+                'trial': t, 
+                'target id': target_id, 
+                'target cluster x [deg]': target_pos[0], 
+                'target cluster y [deg]': target_pos[1],
+                'target pos screen x [px]': cluster_df[cluster_df['target id'] == target_id]['x screen pos'].values[0],
+                'target pos screen y [px]': cluster_df[cluster_df['target id'] == target_id]['y screen pos'].values[0],
+                'target detected x [deg]': trial_target_pos[0],
+                'target detected y [deg]': trial_target_pos[1],
+                'gaze pos x [deg]': np.median(gaze_at_target[:,0]),
+                'gaze pos y [deg]': np.median(gaze_at_target[:,1])
+            }, index=[0])
+            
+            target_fix_df = pd.concat([target_fix_df, new_row], ignore_index=True)
+            
+        # generate affine transformation result 
+        meta.do_affine(target_fix_df)
         
-        # Fall back to the default behavior for known classes
-        return super().find_class(module, name)
+        
 
 def main(meta):
     # initialize meta
     meta.initialization()
         
     # get the dot position
-    # meta.get_dot_position()
+    meta.get_dot_position()
     
     # from the dot positions, define target positions
-    cluster_df = meta.find_target_positions()
+    dots_cluster, cluster_df = meta.find_target_positions()
     
-    # get the gaze data 
-    gaze = meta.get_clean_gaze()
-    
-    # print out the result
-    meta.see_result()
+    # get the displacement between the gaze and the target
+    meta.gaze_vs_target(dots_cluster, cluster_df)
     
         
 if __name__ == "__main__":
     meta = MetaData()
     
     data_dir = 'jiwon_eyes/2024-12-1814-24-22-98722b4d'
-    pkl_path = 'data/jiwon_241218_calib_3.pkl'
-    
     meta.data_dir = data_dir
-    meta.pickle_dir = None
-    # parser = argparse.ArgumentParser(description="show calibration result")
-    # parser.add_argument("--eye_path", required=True, help="Recording data directory")
-    # parser.add_argument("--pkl_path", help="Pickle data directory (optional)")
-    
-    # args = parser.parse_args()
-    # if not os.path.exists(args.eye_path):
-    #     raise Exception('Download directory does not exist')
-    # else:
-    # meta.data_dir = args.eye_path
-
-    # if args.pkl_path & os.path.exists(args.pkl_path):
-    #     meta.pickle_dir = args.pkl_path
-    # elif args.pkl_path & not os.path.exists(args.pkl_path):
-    #     Exception('Pickle directory does not exist')
-
         
     main(meta)
     
