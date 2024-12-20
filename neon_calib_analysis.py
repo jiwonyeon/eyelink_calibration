@@ -39,14 +39,11 @@ class MetaData:
         self.target_pos_screen = target_pos.values
         
         # map the target id
-        target_id = np.zeros(len(trials_df))
+        target_id = np.zeros(len(trials_df), dtype='int')
         for t_id in range(len(target_pos)):
             matching = trials_df[(trials_df['x']==target_pos.iloc[t_id]['x']) & (trials_df['y']==target_pos.iloc[t_id]['y'])].index.values
             target_id[matching] = t_id+1
         trials_df['target id'] = target_id
-        
-        # save in self 
-        self.target_pos = target_pos[['x', 'y']].values
         self.target_id = trials_df['target id'].values
         
         # get markers
@@ -114,8 +111,8 @@ class MetaData:
             
         # find center
         center = [int(np.max(markers[:,0])-np.min(markers[:,0]))/2,
-                int(np.max(markers[:,1])-np.min(markers[:,1]))/2]
-        
+                    int(np.max(markers[:,1])-np.min(markers[:,1]))/2]
+    
         # copy image    
         frame_c = frame.copy()
         frame_chopped = self.frame_chop(frame_c, markers)
@@ -162,42 +159,51 @@ class MetaData:
         world_times = pd.read_csv(os.path.join(self.data_dir, 'world_timestamps.csv'))
         events = pd.read_csv(os.path.join(self.data_dir, 'events.csv'))
         
-        df = pd.DataFrame(columns=['trial', 'target id', 'frame', 'timestamp [ns]', 'dot x [px]', 'dot y [px]',
-                           'azimuth [deg]', 'elevation [deg]'])
+        df = pd.DataFrame(columns=['trial', 'target id', 'frame', 'timestamp [ns]', 'x [px]', 'y [px]',
+                           'x [deg]', 'y [deg]', 'x screen pos', 'y screen pos'])
         
         for e in range(1,self.nEvents+1):
             print(f'Processing trial number {e}')
             start_time = events[events['name'].str.contains(f'trial {e}, target location')]['timestamp [ns]'].values[0]
             end_time = events[events['name'].str.contains(f'trial {e}, end')]['timestamp [ns]'].values[0]
+            target_id = self.target_id[e-1]
+            target_pos = self.target_pos_screen[target_id-1]
 
             frames = world_times[(world_times['timestamp [ns]'] >= start_time) & (world_times['timestamp [ns]'] <= end_time)].index
             for f in range(len(frames)):
                 frame = video[frames[f]].asnumpy()
+                dots = None
                 dots = self.dot_detector(frame)
                 
                 if dots is not None:
                     dva = self.dot_px_to_dva(dots[0], dots[1])
                     new_row = pd.DataFrame({
                     'trial': e,
-                    'target id': self.target_ids[e-1],
+                    'target id': target_id,
                     'frame': frames[f],
                     'timestamp [ns]': world_times['timestamp [ns]'][frames[f]],
-                    'dot x [px]': dots[0] if dots is not None else None,
-                    'dot y [px]': dots[1] if dots is not None else None,
-                    'azimuth [deg]': dva[0],
-                    'elevation [deg]': dva[1]}, index=[0])
+                    'x [px]': dots[0],
+                    'y [px]': dots[1],
+                    'x [deg]': dva[0],
+                    'y [deg]': dva[1], 
+                    'x screen pos': target_pos[0], 
+                    'y screen pos': target_pos[1]}, index=[0])
                 
                     # add new row to df
                     df = pd.concat([df, new_row], ignore_index=True)
 
         # save to csv file 
-        df.to_csv(data_dir + '/dots.csv', index=False)
+        df.to_csv(self.data_dir + '/dots.csv', index=False)
         
     def find_target_positions(self):
         from sklearn.cluster import DBSCAN
         from sklearn.preprocessing import StandardScaler
-        dots = pd.read_csv(os.path.join(self.data_dir, 'dots.csv'))
-        data = dots[['azimuth [deg]', 'elevation [deg]']].values
+        dots_csv = os.path.join(self.data_dir, 'dots.csv')
+        if not os.path.exists(dots_csv):
+            raise Exception('dots.csv does not exist. Run get_dot_position() first.')
+        
+        dots = pd.read_csv(dots_csv)
+        data = dots[['x [deg]', 'y [deg]']].values
 
         scaler = StandardScaler()
         data_scaled = scaler.fit_transform(data)
@@ -214,8 +220,12 @@ class MetaData:
             row = [{'cluster id': c, 
                     'x [deg]': data[clusters == c][:, 0].mean(),
                     'y [deg]': data[clusters == c][:, 1].mean(),
-                    'x [px]': dots['dot x [px]'][clusters == c].mean(),
-                    'y [px]': dots['dot y [px]'][clusters == c].mean()}]
+                    'x [px]': dots['x [px]'][clusters == c].mean(),
+                    'y [px]': dots['y [px]'][clusters == c].mean(), 
+                    'x screen pos': dots['x screen pos'][clusters == c].median(),
+                    'y screen pos': dots['y screen pos'][clusters == c].median()
+                    }]
+
             # append row to cluster_df
             cluster_df = pd.concat([cluster_df, pd.DataFrame(row)], ignore_index=True)
 
@@ -225,26 +235,26 @@ class MetaData:
         cluster_df['dist_center'] = dist
         cluster_df = cluster_df.drop(cluster_df['dist_center'].idxmax())
         cluster_df = cluster_df.drop(cluster_df['dist_center'].idxmin())
-        
+
+        # sort the cluster_df by the target screen position and assign the target id
+        cluster_df = cluster_df.sort_values(by=['x screen pos', 'y screen pos'])
+        cluster_df['target id'] = np.arange(1, len(cluster_df)+1)
+
         # Plot results
         plt.figure(figsize=(8, 6))
         plt.scatter(data[:, 0], data[:, 1], c=clusters, cmap='viridis', s=10)
-        plt.scatter(
-            [pos for pos in cluster_df['x [deg]'].values], 
-            [pos for pos in cluster_df['y [deg]'].values], 
+        plt.scatter(cluster_df['x [deg]'], cluster_df['y [deg]'], 
             color='red', label='Cluster Centers', marker='x', s=100
         )
         plt.title(f"DBSCAN Clustering Results")
         plt.legend()
         plt.savefig(os.path.join(self.data_dir, 'target_dots_dbscan_clusters.png'))
+        # plt.show()
         plt.close()
         
-        ### TODO: how to save the target positions with the target id?
-        ## save the cluster result that matches to the dots 
-        ## from there, get the mean cluster positions in pixels 
-        ## from dots, save the information of the target id
-        ## rather than save this information, return the information to the main function
+        dots_cluster = pd.concat([dots, pd.DataFrame(clusters, columns=['cluster id'])], axis=1)
         
+        return dots_cluster, cluster_df
     
     
     def see_result(self):
@@ -284,10 +294,10 @@ def main(meta):
     meta.initialization()
         
     # get the dot position
-    meta.get_dot_position()
+    # meta.get_dot_position()
     
     # from the dot positions, define target positions
-    target_pos = meta.find_target_positions()
+    cluster_df = meta.find_target_positions()
     
     # get the gaze data 
     gaze = meta.get_clean_gaze()
