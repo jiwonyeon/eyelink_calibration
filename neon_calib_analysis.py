@@ -268,17 +268,14 @@ class MetaData:
         cluster_mean = target_fix_df[['target cluster x [deg]', 'target cluster y [deg]']].drop_duplicates().values
         ax[0].scatter(target_fix_df['gaze pos x [deg]'], target_fix_df['gaze pos y [deg]'], color='black', label='Gaze Fixation', marker='o', s=50)
         ax[0].scatter(cluster_mean[:,0], cluster_mean[:,1], color='red', label='Cluster Centers', marker='x', s=80)
-        ax[0].set_xlim([-30, 30])
-        ax[0].set_ylim([-30, 30])
         ax[0].set_title(f'Before transformation, average offset: {np.nanmean(eye_offset):.2f} deg')
 
         ax[1].scatter(transformed_positions[:,0], transformed_positions[:,1], color='black', label='Gaze Fixation', marker='o', s=50)
-        ax[1].scatter(cluster_mean[:,1], cluster_mean[:,1], color='red', label='Cluster Centers', marker='x', s=80)
-        ax[0].set_xlim([-30, 30])
-        ax[0].set_ylim([-30, 30])
+        ax[1].scatter(cluster_mean[:,0], cluster_mean[:,1], color='red', label='Cluster Centers', marker='x', s=80)
         ax[1].set_title(f'After transformation, average offset: {np.nanmean(affine_offset):.2f} deg')
         
         fig.savefig(os.path.join(self.data_dir, 'gaze_vs_target.png'))
+        plt.close()
         
         # save the transformation matrix
         np.save(os.path.join(self.data_dir, 'affine_matrix.npy'), transform_matrix.params)
@@ -335,7 +332,7 @@ class MetaData:
             target_fix_df = pd.concat([target_fix_df, new_row], ignore_index=True)
             
         # generate affine transformation result 
-        meta.do_affine(target_fix_df)
+        self.do_affine(target_fix_df)
         
         
 
