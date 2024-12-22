@@ -61,7 +61,7 @@ def square_points(len):
 
 def draw_aprilTags(screen):
     # four corners of the screen
-    april_tags_dir = 'april_tags/'
+    april_tags_dir = os.path.join('april_tags')
     pos = 0.8
     positions = [[-pos, pos], [pos, pos], [pos, -pos], [-pos, -pos]]  # Move positions inward
     for i in range(4):
@@ -131,7 +131,7 @@ class Experiment:
             await self.device.recording_start()
             core.wait(2)
         
-        event.waitKeys(keyList=['return']) # wait for the return key to be pressed
+        event.waitKeys(keyList=['enter']) # wait for the return key to be pressed
            
     async def start_loop(self):
         fixation_size = self.config.fixation_size
