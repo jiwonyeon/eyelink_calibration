@@ -9,23 +9,26 @@
 """
 
 import numpy as np
-import os, glob, pickle
+import os, glob, pickle, json
 import asyncio
 from pupil_labs.realtime_api import Device, receive_gaze_data
 from psychopy import visual, core, event, monitors
+from psychopy.hardware import keyboard
 from datetime import datetime
 import numpy as np
 
+kb = keyboard.Keyboard()
+
 class Config:
     def __init__(self):
-        self.subject_id = "jiwon_241218"
-        self.ip = "10.35.120.101"
+        self.subject_id = "jiwon_241223"
+        self.ip = "10.119.105.208"
         self.port = "8080" 
         self.use_device = False
-        self.record = False
-        self.april_tags = True
+        self.record = True
+        self.april_tags = False
         self.repeat = 4
-        self.display = 'FULLSCREEN' # 'FULLSCREEN' or 'WINDOW'
+        self.display = 'WINDOW' # 'FULLSCREEN' or 'WINDOW'
         self.target_radius = .6     # in degree
         self.cursor_radius = .3     # in degree
         self.fixation_size = .3
@@ -47,6 +50,17 @@ class Config:
             self.file_name = f'{self.subject_id}_calib_1'
         else:
             self.file_name = f'{self.subject_id}_calib_{len(pickle_list)+1}'
+            
+    def to_dict(self):
+        return{'subject_id': self.subject_id,
+               'device':  self.use_device,
+                'monitor resolution': self.monitor_resolution,
+                'monitor width cm': self.monitor_width_cm,
+                'viewing distance cm' : self.viewing_distance_cm,
+                'units': self.units, 
+                'data dir': os.path.abspath(self.data_dir),
+                'experiment time': self.time_readable,
+                'saving name': self.file_name}
         
 def square_points(len):
     half_len = len / 2
@@ -88,9 +102,19 @@ class Data:
     def __init__(self):
         self.eye_pos = []
         self.cursor_pos = []
-        self.target_pos = []
+        self.target_pos = None
         self.rt = []
-        self.timestamps = []
+        self.trial_passed = None
+        self.timestamps = None
+        
+    def to_dict(self):
+        return {'eye_pos': self.eye_pos,
+                'cursor_pos': self.cursor_pos,
+                'target_pos': self.target_pos.tolist(),
+                'target_number': self.target_number.tolist(),
+                'rt': self.rt,
+                'timestamps': self.timestamps,
+                'trials_passed': self.trial_passed}
     
 class Experiment:
     def __init__(self, config, device, screen):
@@ -102,12 +126,21 @@ class Experiment:
     async def initialize(self):        
         self.threshold = 0.1    # offset between the mouse click and the target
         self.stim_locations_deg = np.vstack([square_points(20/2), square_points(20)])
-        positions_target = np.tile(np.array(self.stim_locations_deg, dtype=object), (self.config.repeat, 1))
-        self.positions_target = positions_target[np.random.permutation(positions_target.shape[0]), :]
+        target_number = np.arange(0, len(self.stim_locations_deg))
+        self.data.target_number = np.random.permutation(np.tile(target_number, self.config.repeat))
+        self.data.target_pos = self.stim_locations_deg[self.data.target_number, :]
+        self.n_targets = np.shape(self.data.target_pos)[0]
+        print(f"Number of trials: {self.n_targets}")
         if self.device is not None:
             status = await self.device.get_status()
             self.sensor_gaze = status.direct_gaze_sensor()
-        self.n_targets = np.shape(self.positions_target)[0]
+            
+    async def check_escape_key(self):
+        keys = kb.getKeys(keyList=['escape'], waitRelease=False)
+        if keys:
+            print("Experiment stopped by user")
+            await self.end_experiment()
+            core.quit()  # Forcefully exit PsychoPy
             
     async def start_experiment(self):
         # show the screen
@@ -131,7 +164,14 @@ class Experiment:
             await self.device.recording_start()
             core.wait(2)
         
-        event.waitKeys(keyList=['enter']) # wait for the return key to be pressed
+        # wait for the return key to be pressed        
+        key_pressed = None
+        while not key_pressed:
+            keys = kb.getKeys(keyList=['return'], waitRelease=False)
+            if keys:
+                key_pressed = keys[0]
+                print('Experiment start!')
+        
            
     async def start_loop(self):
         fixation_size = self.config.fixation_size
@@ -142,12 +182,15 @@ class Experiment:
         restart_on_disconnect = True
 
         for trial_num in range(self.n_targets):
+            # check escape key
+            # await self.check_escape_key()
+            
             # initialize everything
-            clock = core.Clock()
             buff_eyes = []
             buff_cursor = []
-            rt = []
-            target_pos = self.positions_target[trial_num,:]
+            rt = None
+            timestamp = []
+            target_pos = self.data.target_pos[trial_num,:]
             flag = True
             first_frame = True
 
@@ -159,121 +202,103 @@ class Experiment:
             # show the fixation 
             fixation.draw()
             
-            # flip the screen 
+            # flip the screen - fixation presentation 
             if self.config.april_tags:
                 draw_aprilTags(self.screen)
             self.screen.flip()
-            self.data.timestamps.append([f'trial {trial_num+1}, fixation', core.getAbsTime()])
+            timestamp.append(core.getAbsTime())
             
             # send the event 
             if self.config.record and self.device is not None:
                 await self.device.send_event(f"trial {trial_num+1}, fixation") 
             
-            # wait for 500ms
-            core.wait(0.5)
+            # wait for 200ms
+            core.wait(0.2)
             
             # prepare for the trial
-            self.data.timestamps.append([f'trial {trial_num+1}, target', core.getAbsTime()])
-            if self.config.record and self.device is not None:
-                await self.device.send_event(f"trial {trial_num+1}, target location: ({target_pos[0], target_pos[1]})")            
             target = visual.GratingStim(self.screen, color=1, colorSpace='rgb',tex=None, mask='circle', 
                                         size=self.config.target_radius, pos=target_pos)
-            clock.reset()
-            
+
             while flag:                
                 try:
+                    # Check for escape key
+                    # await self.check_escape_key()
+                    
+                    # if it is the first frame, set the mouse position to the center
+                    if first_frame:
+                        mouse.setPos((0,0))
+                    
+                    # draw cursor, target, and move the mouse pos                                
+                    target.draw()
+                    cursor.pos = mouse.getPos()                                              
+                    cursor.draw()
+                    if self.config.april_tags:
+                        draw_aprilTags(self.screen)
+                    
+                    # flip the screen. Save the timestamp if it is the first frame
+                    self.screen.flip()
+                    if first_frame:
+                        timestamp.append(core.getAbsTime())
+                        if self.config.record and self.device is not None:
+                           await self.device.send_event(f"trial {trial_num+1}, target location: ({target_pos[0], target_pos[1]})")            
+
+                        first_frame = False
+                    
+                    # get the gaze data if possible    
                     if self.device is not None:
                         async for gaze in receive_gaze_data(self.sensor_gaze.url, run_loop=restart_on_disconnect):
-                            # Check for escape key
-                            if 'escape' in event.getKeys():
-                                print("Experiment stopped by user")
-                                await self.end_experiment()
-                                return
-                            
-                            # get mouse position and update
-                            if first_frame:
-                                mouse.setPos((0,0))
-                                first_frame = False
-                                
-                            cursor.pos = mouse.getPos()              
-                            target.draw()
-                            cursor.draw()
-                            if self.config.april_tags:
-                                draw_aprilTags(self.screen)
-                            self.screen.flip()
-                                    
-                            # save data
-                            buff_eyes.append([gaze.x, gaze.y])
-                            buff_cursor.append(list(cursor.pos))                            
-        
-                            # Check for mouse click
-                            if mouse.getPressed()[0]:  # Left mouse button
-                                print(f"Mouse clicked at: {cursor.pos}")
-                                distance = np.linalg.norm(target_pos - cursor.pos)
-                                if distance <= self.threshold:
-                                    rt.append(clock.getTime())
-                                    print(f"Valid click! Target position: {target_pos}, Mouse position: {cursor.pos}")
-                                    print(f'Time took: {rt[-1]}')
-                                    self.data.timestamps.append([f'trial {trial_num+1}, end', core.getAbsTime()])
-                                    flag = False
-                                    
-                                    # send the event 
-                                    if self.config.record and self.device is not None:
-                                        await self.device.send_event(f"trial {trial_num+1}, end")                        
-                                    
-                                    # save the interim data
-                                    data_to_save = {'config': self.config, 'data': self.data}
-                                    with open(os.path.join(self.config.data_dir, f'{self.config.file_name}_temp.pkl'), 'wb') as file:
-                                        pickle.dump(data_to_save, file)
-                                    
-                                    break
-                                else:
-                                    print(f"Invalid click. Mouse {cursor.pos} and target {target_pos}. Try again.")
-                        
-                    else:
-                        # debugging mode
-                        # Check for escape key
-                        if 'escape' in event.getKeys():
-                            print("Experiment stopped by user")
-                            await self.end_experiment()
-                            return
-                        
-                        # get mouse position and update
-                        if first_frame:
-                            mouse.setPos((0,0))
-                            first_frame = False
-                            
-                        cursor.pos = mouse.getPos()              
-                        target.draw()
-                        cursor.draw()
-                        if self.config.april_tags:
-                            draw_aprilTags(self.screen)
-                        self.screen.flip()
+                            # save eye and cursor position
+                            buff_eyes.append([float(gaze.x), float(gaze.y)])
 
-                        # Check for mouse click
-                        if mouse.getPressed()[0]:  # Left mouse button
-                            print(f"Mouse clicked at: {cursor.pos}")
-                            distance = np.linalg.norm(target_pos - cursor.pos)
-                            if distance <= self.threshold:
-                                rt.append(clock.getTime())
-                                print(f"Valid click! Target position: {target_pos}, Mouse position: {cursor.pos}")
-                                print(f'Time took: {rt[-1]}')
-                                flag = False
-                                break
+                    # save the cursor position
+                    if self.config.record:
+                        buff_cursor.append(list(cursor.pos))                            
+        
+                    # Check for mouse click
+                    if mouse.getPressed()[0]:  # Left mouse button
+                        print(f"Mouse clicked at: {cursor.pos}")
+                        distance = np.linalg.norm(target_pos - cursor.pos)
+                        
+                        # save the cursor position
+                        if self.config.record:
+                            buff_cursor.append(list(cursor.pos))
+                            
+                        # check if the click is valid
+                        if distance <= self.threshold:                            
+                            trial_end = core.getAbsTime()
+                            timestamp.append(trial_end)
+                            rt = trial_end - timestamp[0]
+                            print(f"Valid click! Target position: {target_pos}, Mouse position: {cursor.pos}")
+                            print(f'Time took: {rt:.4}')
+                            flag = False
+                                    
+                            # send the event 
+                            if self.config.record and self.device is not None:
+                                await self.device.send_event(f"trial {trial_num+1}, end")       
                             else:
-                                print(f"Invalid click. Mouse {cursor.pos} and target {target_pos}. Try again.")
-                        
-                        
+                                buff_eyes = None                 
+                                    
+                            break
+                        else:
+                            print(f"Invalid click. Mouse {cursor.pos} and target {target_pos}. Try again.")
+                  
                 except Exception as e:
-                    print(f"ERROR: {e}")
+                    print(f"Error: {e}")
+                    await self.end_experiment()
                     break
             
-            # save the data    
-            self.data.target_pos.append(target_pos)
+            # save the interim data
             self.data.eye_pos.append(buff_eyes)
             self.data.cursor_pos.append(buff_cursor)
             self.data.rt.append(rt)
-        
+            self.data.timestamps = timestamp
+            self.data.trial_passed = trial_num + 1
+            
+            data_to_save = {'config': self.config.to_dict(), 'data': self.data.to_dict()}
+            with open(os.path.join(self.config.data_dir, f'{self.config.file_name}_temp.json'), 'w') as file:
+                json.dump(data_to_save, file)
+            
+            
     async def end_experiment(self):
         # thank you note
         msg = visual.TextStim(self.screen, text='The experiment ended. \nThank you.')
@@ -281,17 +306,17 @@ class Experiment:
         self.screen.flip()
         
         # save the data if it was recorded
-        if self.config.record:
+        if self.config.record and self.device is not None:
             await self.device.recording_stop_and_save()
         
         # save the experiment 
-        data_to_save = {'config': self.config, 'data': self.data}
-        with open(os.path.join(self.config.data_dir, f'{self.config.file_name}.pkl'), 'wb') as file:
-            pickle.dump(data_to_save, file)
+        data_to_save = {'config': self.config.to_dict(), 'data': self.data.to_dict()}
+        with open(os.path.join(self.config.data_dir, f'{self.config.file_name}.json'), 'w') as file:
+            json.dump(data_to_save, file)
             
         # remove interim data
-        if os.path.exists(os.path.join(self.config.data_dir, f'{self.config.file_name}_temp.pkl')):
-            os.remove(os.path.join(self.config.data_dir, f'{self.config.file_name}_temp.pkl'))
+        if os.path.exists(os.path.join(self.config.data_dir, f'{self.config.file_name}_temp.json')):
+            os.remove(os.path.join(self.config.data_dir, f'{self.config.file_name}_temp.json'))
         
         # shut the window
         core.wait(3)
