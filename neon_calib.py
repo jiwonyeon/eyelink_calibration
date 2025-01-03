@@ -45,7 +45,7 @@ class Config:
         self.saving_name()
         
     def saving_name(self):
-        pickle_list = glob.glob(os.path.join(self.data_dir, f'{self.subject_id}_calib_*.pkl'))
+        pickle_list = glob.glob(os.path.join(self.data_dir, f'{self.subject_id}_calib_*.json'))
         if len(pickle_list) == 0:
             self.file_name = f'{self.subject_id}_calib_1'
         else:
@@ -105,7 +105,7 @@ class Data:
         self.target_pos = None
         self.rt = []
         self.trial_passed = None
-        self.timestamps = None
+        self.timestamps = []
         
     def to_dict(self):
         return {'eye_pos': self.eye_pos,
@@ -183,13 +183,12 @@ class Experiment:
 
         for trial_num in range(self.n_targets):
             # check escape key
-            # await self.check_escape_key()
+            await self.check_escape_key()
             
             # initialize everything
             buff_eyes = []
             buff_cursor = []
             rt = None
-            timestamp = []
             target_pos = self.data.target_pos[trial_num,:]
             flag = True
             first_frame = True
@@ -206,7 +205,7 @@ class Experiment:
             if self.config.april_tags:
                 draw_aprilTags(self.screen)
             self.screen.flip()
-            timestamp.append(core.getAbsTime())
+            t_screen_flip = core.getTime()
             
             # send the event 
             if self.config.record and self.device is not None:
@@ -222,7 +221,7 @@ class Experiment:
             while flag:                
                 try:
                     # Check for escape key
-                    # await self.check_escape_key()
+                    await self.check_escape_key()
                     
                     # if it is the first frame, set the mouse position to the center
                     if first_frame:
@@ -238,7 +237,7 @@ class Experiment:
                     # flip the screen. Save the timestamp if it is the first frame
                     self.screen.flip()
                     if first_frame:
-                        timestamp.append(core.getAbsTime())
+                        t_first_frame = core.getTime()
                         if self.config.record and self.device is not None:
                            await self.device.send_event(f"trial {trial_num+1}, target location: ({target_pos[0], target_pos[1]})")            
 
@@ -259,17 +258,17 @@ class Experiment:
                         print(f"Mouse clicked at: {cursor.pos}")
                         distance = np.linalg.norm(target_pos - cursor.pos)
                         
+                        t_respond = core.getTime()
+                        
                         # save the cursor position
                         if self.config.record:
                             buff_cursor.append(list(cursor.pos))
                             
                         # check if the click is valid
                         if distance <= self.threshold:                            
-                            trial_end = core.getAbsTime()
-                            timestamp.append(trial_end)
-                            rt = trial_end - timestamp[0]
+                            rt = t_respond - t_first_frame
                             print(f"Valid click! Target position: {target_pos}, Mouse position: {cursor.pos}")
-                            print(f'Time took: {rt:.4}')
+                            print(f'Time took: {rt/1e9} seconds')
                             flag = False
                                     
                             # send the event 
@@ -277,8 +276,6 @@ class Experiment:
                                 await self.device.send_event(f"trial {trial_num+1}, end")       
                             else:
                                 buff_eyes = None                 
-                                    
-                            break
                         else:
                             print(f"Invalid click. Mouse {cursor.pos} and target {target_pos}. Try again.")
                   
@@ -291,7 +288,7 @@ class Experiment:
             self.data.eye_pos.append(buff_eyes)
             self.data.cursor_pos.append(buff_cursor)
             self.data.rt.append(rt)
-            self.data.timestamps = timestamp
+            self.data.timestamps.append([t_screen_flip, t_first_frame, t_respond])
             self.data.trial_passed = trial_num + 1
             
             data_to_save = {'config': self.config.to_dict(), 'data': self.data.to_dict()}
